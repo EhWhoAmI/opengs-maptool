@@ -26,6 +26,8 @@ def generate_territory_map(main_layout):
     density_arr = np.array(main_layout.density_image)
     density_strength = main_layout.territory_density_strength.value() / 10.0
     exclude_ocean_density = main_layout.territory_exclude_ocean_density.isChecked()
+    jagged_land = main_layout.territory_jagged_land.isChecked()
+    jagged_ocean = main_layout.territory_jagged_ocean.isChecked()
 
     land_points = main_layout.territory_land_slider.value()
     sea_points = main_layout.territory_ocean_slider.value()
@@ -39,7 +41,8 @@ def generate_territory_map(main_layout):
     land_map, land_meta, next_index = create_region_map(
         masks["land_fill"], masks["land_border"], land_points, 0,
         "land", series, "territory_id", "territory_type", step_fn=step,
-        density=density_arr, density_strength=density_strength
+        density=density_arr, density_strength=density_strength,
+        jagged=jagged_land
     )
 
     sea_density = None if exclude_ocean_density else density_arr
@@ -49,7 +52,8 @@ def generate_territory_map(main_layout):
         sea_map, sea_meta, _ = create_region_map(
             masks["sea_fill"], masks["sea_border"], sea_points, next_index,
             "ocean", series, "territory_id", "territory_type", step_fn=step,
-            density=sea_density, density_strength=sea_density_strength
+            density=sea_density, density_strength=sea_density_strength,
+            jagged=jagged_ocean
         )
     else:
         sea_map = np.full((masks["map_h"], masks["map_w"]), -1, np.int32)

@@ -2,7 +2,7 @@ import config
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QProgressBar, QTabWidget, QLabel
 from logic.province_generator import generate_province_map
 from logic.territory_generator import generate_territory_map
-from logic.import_module import import_image, import_density_image
+from logic.import_module import import_image, import_density_image, import_terrain_image
 from logic.density_generator import normalize_density, equator_density
 from logic.export_module import (export_image, export_territory_definitions,
                                  export_territory_history,
@@ -94,7 +94,27 @@ class MainWindow(QWidget):
                       "Import Density Image",
                       lambda: import_density_image(self))
 
-        # TAB4 TERRITORY IMAGE
+        self.territory_exclude_ocean_density = create_checkbox(
+            density_tab_layout, "Territory Exclude Ocean")
+
+        self.province_exclude_ocean_density = create_checkbox(
+            density_tab_layout, "Province Exclude Ocean")
+
+        # TAB4 TERRAIN IMAGE
+        self.terrain_tab = QWidget()
+        self.terrain_image_display = ImageDisplay()
+        terrain_tab_layout = QVBoxLayout(self.terrain_tab)
+        terrain_tab_layout.addWidget(self.terrain_image_display)
+        self.tabs.addTab(self.terrain_tab, "Terrain Image")
+
+        create_button(terrain_tab_layout,
+                      "Import Terrain Image",
+                      lambda: import_terrain_image(self))
+
+        # State
+        self.terrain_image = None
+
+        # TAB5 TERRITORY IMAGE
         self.territory_tab = QWidget()
         self.territory_image_display = ImageDisplay()
         territory_tab_layout = QVBoxLayout(self.territory_tab)
@@ -137,8 +157,13 @@ class MainWindow(QWidget):
             config.DENSITY_STRENGTH_STEP,
             display_scale=0.1)
 
-        self.territory_exclude_ocean_density = create_checkbox(
-            territory_density_row, "Exclude Ocean")
+        jagged_col = QVBoxLayout()
+        territory_density_row.addLayout(jagged_col)
+
+        self.territory_jagged_land = create_checkbox(
+            jagged_col, "Jagged Land Borders")
+        self.territory_jagged_ocean = create_checkbox(
+            jagged_col, "Jagged Ocean Borders")
 
         self.button_gen_territories = create_button(territory_tab_layout,
                                                     "Generate Territories",
@@ -204,8 +229,13 @@ class MainWindow(QWidget):
             config.DENSITY_STRENGTH_STEP,
             display_scale=0.1)
 
-        self.province_exclude_ocean_density = create_checkbox(
-            province_density_row, "Exclude Ocean")
+        prov_jagged_col = QVBoxLayout()
+        province_density_row.addLayout(prov_jagged_col)
+
+        self.province_jagged_land = create_checkbox(
+            prov_jagged_col, "Jagged Land Borders")
+        self.province_jagged_ocean = create_checkbox(
+            prov_jagged_col, "Jagged Ocean Borders")
 
         self.button_gen_prov = create_button(province_tab_layout,
                                              "Generate Provinces",

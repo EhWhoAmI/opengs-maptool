@@ -44,6 +44,7 @@ MAX_IMAGE_PIXELS = 300000000
 
 # Generation algorithm
 LLOYD_ITERATIONS = 4
+JAGGED_BORDER_AMPLITUDE = 0.12  # fraction of avg seed spacing used as noise
 
 # Number Series
 PROVINCE_ID_PREFIX = "PRV"
@@ -60,3 +61,33 @@ DENSITY_STRENGTH_MIN = 0
 DENSITY_STRENGTH_MAX = 50
 DENSITY_STRENGTH_TICK = 5
 DENSITY_STRENGTH_STEP = 1
+
+# Terrain Types — color: (R, G, B)
+LAND_TERRAIN_TYPES = {
+    "forest":   (89, 199, 85),
+    "hills":    (248, 255, 153),
+    "mountain": (157, 192, 208),
+    "plains":   (255, 129, 66),
+    "urban":    (120, 120, 120),
+    "jungle":   (127, 191, 0),
+    "marsh":    (76, 96, 35),
+    "desert":   (255, 127, 0),
+}
+
+NAVAL_TERRAIN_TYPES = {
+    "deep_ocean":   (2, 38, 150),
+    "shallow_sea":  (56, 118, 217),
+    "fjords":       (75, 162, 198),
+}
+
+LAKE_TERRAIN_TYPES = {
+    "lakes": (58, 91, 255),
+}
+
+# All terrain types combined (for color lookup)
+TERRAIN_TYPES = {**LAND_TERRAIN_TYPES, **NAVAL_TERRAIN_TYPES, **LAKE_TERRAIN_TYPES}
+
+# Default terrain per province type (used when no terrain image or no color match)
+DEFAULT_TERRAIN_LAND = "plains"
+DEFAULT_TERRAIN_OCEAN = "deep_ocean"
+DEFAULT_TERRAIN_LAKE = "lakes"

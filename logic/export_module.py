@@ -83,23 +83,34 @@ def export_province_definitions(main_layout):
     if not path:
         return
 
+    has_terrain = any("province_terrain" in d for d in province_data)
+
     if fmt == "json":
         data = {}
         for d in province_data:
-            data[d["province_id"]] = {
+            entry = {
                 "province_type": d["province_type"],
                 "R": d["R"], "G": d["G"], "B": d["B"],
                 "x": round(d["x"], 2), "y": round(d["y"], 2),
             }
+            if has_terrain:
+                entry["province_terrain"] = d.get("province_terrain", "unknown")
+            data[d["province_id"]] = entry
         _write_json(path, data)
     else:
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=';')
-            w.writerow(["id", "province_type", "R", "G", "B", "x", "y"])
+            header = ["id", "province_type", "R", "G", "B", "x", "y"]
+            if has_terrain:
+                header.append("province_terrain")
+            w.writerow(header)
             for d in province_data:
-                w.writerow([d["province_id"], d["province_type"],
-                            d["R"], d["G"], d["B"],
-                            round(d["x"], 2), round(d["y"], 2)])
+                row = [d["province_id"], d["province_type"],
+                       d["R"], d["G"], d["B"],
+                       round(d["x"], 2), round(d["y"], 2)]
+                if has_terrain:
+                    row.append(d.get("province_terrain", "unknown"))
+                w.writerow(row)
 
 
 

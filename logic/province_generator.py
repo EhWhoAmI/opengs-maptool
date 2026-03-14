@@ -20,6 +20,8 @@ def generate_province_map(main_layout):
     density_arr = np.array(main_layout.density_image)
     density_strength = main_layout.province_density_strength.value() / 10.0
     exclude_ocean_density = main_layout.province_exclude_ocean_density.isChecked()
+    jagged_land = main_layout.province_jagged_land.isChecked()
+    jagged_ocean = main_layout.province_jagged_ocean.isChecked()
     map_h, map_w = masks["map_h"], masks["map_w"]
 
     total_land_provs = main_layout.land_slider.value()
@@ -131,10 +133,12 @@ def generate_province_map(main_layout):
             terr_density = density_arr
             terr_density_strength = density_strength
 
+        jagged = jagged_land if ptype == "land" else jagged_ocean
         pmap, meta, next_index = create_region_map(
             terr_fill, terr_border, prov_count, start_index,
             ptype, series, "province_id", "province_type",
-            density=terr_density, density_strength=terr_density_strength
+            density=terr_density, density_strength=terr_density_strength,
+            jagged=jagged
         )
 
         # Tag each province with its parent territory
@@ -164,6 +168,21 @@ def generate_province_map(main_layout):
         out[valid] = color_lut[province_pmap[valid]]
     province_image = Image.fromarray(out)
     step(1)
+
+    # Assign terrain from terrain image, or use defaults
+    terrain_image = getattr(main_layout, "terrain_image", None)
+    if terrain_image is not None:
+        terrain_arr = np.array(terrain_image)
+        _assign_terrain(all_metadata, terrain_arr)
+    else:
+        for prov in all_metadata:
+            ptype = prov["province_type"]
+            if ptype == "lake":
+                prov["province_terrain"] = config.DEFAULT_TERRAIN_LAKE
+            elif ptype == "ocean":
+                prov["province_terrain"] = config.DEFAULT_TERRAIN_OCEAN
+            else:
+                prov["province_terrain"] = config.DEFAULT_TERRAIN_LAND
 
     main_layout.province_image_display.set_image(province_image)
     main_layout.province_data = all_metadata
@@ -221,3 +240,35 @@ def _distribute(territories, total_provinces, pixel_counts,
                 diff += 1
 
     return alloc
+
+
+def _assign_terrain(metadata, terrain_arr):
+    """Look up terrain color at each province center and assign province_terrain.
+
+    Enforces category constraints: land provinces only get land terrains,
+    ocean provinces only get naval terrains, lake provinces get lake terrain.
+    Falls back to the configured default for each province type.
+    """
+    h, w = terrain_arr.shape[:2]
+
+    # Build per-category lookups: (R, G, B) -> terrain name
+    land_lookup = {color: name for name, color in config.LAND_TERRAIN_TYPES.items()}
+    naval_lookup = {color: name for name, color in config.NAVAL_TERRAIN_TYPES.items()}
+    lake_lookup = {color: name for name, color in config.LAKE_TERRAIN_TYPES.items()}
+
+    for prov in metadata:
+        px = int(round(prov["x"]))
+        py = int(round(prov["y"]))
+        px = max(0, min(px, w - 1))
+        py = max(0, min(py, h - 1))
+        pixel = (int(terrain_arr[py, px, 0]),
+                 int(terrain_arr[py, px, 1]),
+                 int(terrain_arr[py, px, 2]))
+
+        ptype = prov["province_type"]
+        if ptype == "lake":
+            prov["province_terrain"] = lake_lookup.get(pixel, config.DEFAULT_TERRAIN_LAKE)
+        elif ptype == "ocean":
+            prov["province_terrain"] = naval_lookup.get(pixel, config.DEFAULT_TERRAIN_OCEAN)
+        else:
+            prov["province_terrain"] = land_lookup.get(pixel, config.DEFAULT_TERRAIN_LAND)

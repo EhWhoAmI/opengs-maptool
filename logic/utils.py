@@ -118,7 +118,73 @@ def lloyd_relaxation(mask, point_seeds, rng_seed=None, iterations=4, step_fn=Non
     return [(int(x), int(y)) for x, y in seeds_arr]
 
 
-def assign_regions(mask, seeds, start_index):
+def _build_jitter_maps(h, w, seeds_arr):
+    """Build spatially-correlated noise maps for jagged border effect.
+
+    Returns (jitter_x, jitter_y) arrays of shape (h, w), or (None, None)
+    if jagged borders cannot be applied.
+    """
+    if len(seeds_arr) < 2:
+        return None, None
+
+    from scipy.ndimage import zoom as ndzoom
+
+    rng = np.random.default_rng(42)
+    seed_tree = cKDTree(seeds_arr)
+    nn_dists, _ = seed_tree.query(seeds_arr, k=2)
+    avg_dist = float(nn_dists[:, 1].mean())
+    amplitude = avg_dist * config.JAGGED_BORDER_AMPLITUDE
+
+    # Coarse noise grid — each cell covers ~avg_dist/4 pixels
+    cell = max(4, int(avg_dist / 4))
+    ch = (h + cell - 1) // cell + 1
+    cw = (w + cell - 1) // cell + 1
+    jx = ndzoom(rng.uniform(-amplitude, amplitude, (ch, cw)),
+                cell, order=1)[:h, :w].astype(np.float32)
+    jy = ndzoom(rng.uniform(-amplitude, amplitude, (ch, cw)),
+                cell, order=1)[:h, :w].astype(np.float32)
+    return jx, jy
+
+
+def _jitter_coords(coords_xy, coords_yx, jitter_x, jitter_y):
+    """Return a copy of coords_xy with spatially-correlated noise added."""
+    out = coords_xy.copy()
+    out[:, 0] += jitter_x[coords_yx[:, 0], coords_yx[:, 1]]
+    out[:, 1] += jitter_y[coords_yx[:, 0], coords_yx[:, 1]]
+    return out
+
+
+def _remove_enclaves(pmap, mask):
+    """Reassign disconnected region fragments to surrounding regions.
+
+    For each region, keeps only the largest connected component.
+    Smaller fragments are cleared and then filled from their nearest
+    assigned neighbor, eliminating enclaves.
+    """
+    unique_ids = np.unique(pmap[mask])
+    unique_ids = unique_ids[unique_ids >= 0]
+
+    cleared = np.zeros(pmap.shape, dtype=bool)
+
+    for rid in unique_ids:
+        region_mask = pmap == rid
+        labeled, n = ndlabel(region_mask)
+        if n <= 1:
+            continue
+        # Keep only the largest component
+        comp_sizes = np.bincount(labeled.ravel())[1:]  # skip background 0
+        largest = comp_sizes.argmax() + 1
+        small = region_mask & (labeled != largest)
+        pmap[small] = -1
+        cleared |= small
+
+    # Fill cleared pixels from nearest assigned neighbor
+    if cleared.any() and (pmap >= 0).any():
+        _, (ny, nx) = distance_transform_edt(pmap < 0, return_indices=True)
+        pmap[cleared] = pmap[ny[cleared], nx[cleared]]
+
+
+def assign_regions(mask, seeds, start_index, jagged=False):
     """
     Assign each pixel in mask to the nearest seed, respecting boundaries.
 
@@ -127,6 +193,11 @@ def assign_regions(mask, seeds, start_index):
     pixels within their own component, preventing assignments from crossing
     boundary lines.  Seedless components are filled by nearest assigned
     pixel (Euclidean fallback).
+
+    When jagged=True, spatially-correlated noise is added to pixel
+    coordinates before the nearest-seed query, producing irregular
+    borders instead of straight Voronoi edges.  A post-processing pass
+    removes any enclaves created by the noise.
     """
     h, w = mask.shape
     pmap = np.full((h, w), -1, np.int32)
@@ -136,6 +207,11 @@ def assign_regions(mask, seeds, start_index):
 
     seeds_arr = np.array(seeds, dtype=np.float32)
 
+    # Precompute jitter noise maps if jagged borders enabled
+    jitter_x = jitter_y = None
+    if jagged:
+        jitter_x, jitter_y = _build_jitter_maps(h, w, seeds_arr)
+
     # Label connected components of mask
     labeled, num_components = ndlabel(mask)
 
@@ -143,8 +219,12 @@ def assign_regions(mask, seeds, start_index):
         # Single component (or empty) — fast global KDTree
         coords_yx = np.column_stack(np.where(mask))
         coords_xy = np.flip(coords_yx, axis=1).astype(np.float32)
+        query_xy = coords_xy
+        if jitter_x is not None:
+            query_xy = _jitter_coords(coords_xy, coords_yx,
+                                      jitter_x, jitter_y)
         tree = cKDTree(seeds_arr)
-        _, labels = tree.query(coords_xy, k=1)
+        _, labels = tree.query(query_xy, k=1)
         pmap[coords_yx[:, 0], coords_yx[:, 1]] = labels + start_index
     else:
         # Map each seed to its component
@@ -163,10 +243,14 @@ def assign_regions(mask, seeds, start_index):
             comp_mask = labeled == comp_id
             coords_yx = np.column_stack(np.where(comp_mask))
             coords_xy = np.flip(coords_yx, axis=1).astype(np.float32)
+            query_xy = coords_xy
+            if jitter_x is not None:
+                query_xy = _jitter_coords(coords_xy, coords_yx,
+                                          jitter_x, jitter_y)
 
             local_seeds = seeds_arr[seed_indices]
             tree = cKDTree(local_seeds)
-            _, labels = tree.query(coords_xy, k=1)
+            _, labels = tree.query(query_xy, k=1)
 
             global_indices = np.array(seed_indices, dtype=np.int32)
             pmap[coords_yx[:, 0], coords_yx[:, 1]] = (
@@ -179,6 +263,10 @@ def assign_regions(mask, seeds, start_index):
                 pmap < 0, return_indices=True)
             ua = unassigned
             pmap[ua] = pmap[ny[ua], nx[ua]]
+
+    # Remove enclaves created by jitter
+    if jitter_x is not None:
+        _remove_enclaves(pmap, mask)
 
     return pmap
 
@@ -328,7 +416,7 @@ def extract_masks(boundary_image, land_image):
 
 def create_region_map(fill_mask, border_mask, num_points, start_index,
                       ptype, series, id_key, type_key, step_fn=None,
-                      density=None, density_strength=1.0):
+                      density=None, density_strength=1.0, jagged=False):
     """Unified region map creator for both provinces and territories.
 
     id_key/type_key control metadata key names (e.g. "province_id"/"province_type"
@@ -353,7 +441,7 @@ def create_region_map(fill_mask, border_mask, num_points, start_index,
     seeds = lloyd_relaxation(fill_mask, seeds,
                              iterations=config.LLOYD_ITERATIONS, step_fn=_step)
 
-    pmap = assign_regions(fill_mask, seeds, start_index)
+    pmap = assign_regions(fill_mask, seeds, start_index, jagged=jagged)
     _step(1)  # assign done
 
     metadata = _build_region_metadata(pmap, seeds, start_index, ptype,

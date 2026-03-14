@@ -27,6 +27,22 @@ def import_image(layout, text, image_display):
     layout.check_territory_ready()
 
 
+def import_terrain_image(layout):
+    Image.MAX_IMAGE_PIXELS = config.MAX_IMAGE_PIXELS
+    path, _ = QFileDialog.getOpenFileName(
+        layout,
+        "Import Terrain Image",
+        "",
+        "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+    )
+    if not path:
+        return
+
+    terrain = Image.open(path).convert("RGB")
+    layout.terrain_image = terrain
+    layout.terrain_image_display.set_image(terrain.convert("RGBA"))
+
+
 def import_density_image(layout):
     Image.MAX_IMAGE_PIXELS = config.MAX_IMAGE_PIXELS
     path, _ = QFileDialog.getOpenFileName(
