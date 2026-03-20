@@ -13,6 +13,30 @@ STEPS_PER_REGION_MAP = 1 + config.LLOYD_ITERATIONS + 1 + 1
 used_colors = set()
 
 
+def _pixel_to_sphere(xy_arr, h, w):
+    """Convert (x, y) pixel coords to unit-sphere 3D coords (equirectangular).
+
+    Assumes x ∈ [0, w] maps longitude −π..+π and
+            y ∈ [0, h] maps latitude +π/2..−π/2 (north-pole at top).
+    """
+    lon = (xy_arr[..., 0] / w) * (2 * np.pi) - np.pi
+    lat = np.pi / 2 - (xy_arr[..., 1] / h) * np.pi
+    cos_lat = np.cos(lat)
+    return np.stack([cos_lat * np.cos(lon),
+                     cos_lat * np.sin(lon),
+                     np.sin(lat)], axis=-1).astype(np.float32)
+
+
+def _sphere_to_pixel(xyz_arr, h, w):
+    """Convert unit-sphere 3D coords back to (x, y) pixel coords."""
+    z = np.clip(xyz_arr[..., 2], -1.0, 1.0)
+    lat = np.arcsin(z)
+    lon = np.arctan2(xyz_arr[..., 1], xyz_arr[..., 0])
+    x = (lon + np.pi) / (2 * np.pi) * w
+    y = (np.pi / 2 - lat) / np.pi * h
+    return np.stack([x, y], axis=-1).astype(np.float32)
+
+
 def clear_used_colors():
     used_colors.clear()
 
@@ -38,22 +62,39 @@ def color_from_id(index, ptype):
 
 
 def random_seeds(mask, num_points, rng_seed=None, density=None,
-                 density_strength=1.0):
+                 density_strength=1.0, coords_yx=None, spherical=False):
     """Pick num_points random pixels from mask.
 
     When density is provided (2D uint8 array, same shape as mask),
     darker pixels attract more seeds: weight = (256 - pixel_value) ^ density_strength.
+    When spherical=True, weights are also multiplied by cos(latitude) so that
+    seeds are distributed uniformly on the sphere rather than uniformly on the
+    flat image (which over-samples near the poles of an equirectangular map).
+    coords_yx may be supplied to avoid recomputing np.where(mask).
     """
-    coords_yx = np.column_stack(np.where(mask))
+    if coords_yx is None:
+        coords_yx = np.column_stack(np.where(mask))
     if coords_yx.size == 0 or num_points <= 0:
         return []
 
     rng = np.random.default_rng(rng_seed)
     n = min(num_points, len(coords_yx))
 
+    weights = None
+
     if density is not None:
         weights = 256.0 - density[coords_yx[:, 0], coords_yx[:, 1]].astype(np.float64)
         weights = weights ** density_strength
+
+    if spherical:
+        h = mask.shape[0]
+        ys = coords_yx[:, 0].astype(np.float64)
+        # cos(lat) = sin(π·y/h); 0 at poles, 1 at equator
+        cos_lat = np.sin(np.pi * ys / h)
+        cos_lat = np.clip(cos_lat, 1e-10, None)
+        weights = cos_lat if weights is None else weights * cos_lat
+
+    if weights is not None:
         total = weights.sum()
         if total > 0:
             prob = weights / total
@@ -66,15 +107,20 @@ def random_seeds(mask, num_points, rng_seed=None, density=None,
     return [(int(x), int(y)) for y, x in coords_yx[indices]]
 
 
-def lloyd_relaxation(mask, point_seeds, rng_seed=None, iterations=4, step_fn=None):
+def lloyd_relaxation(mask, point_seeds, rng_seed=None, iterations=4, step_fn=None,
+                     coords_yx=None, spherical=False):
     """
     Improve seed placement by iteratively moving each seed to the centroid
     of its Voronoi cell.
+    When spherical=True the centroid is computed on the unit sphere (equirectangular
+    projection assumed) so that regions relax to equal-area cells on the globe.
+    coords_yx may be supplied to avoid recomputing np.where(mask).
     """
     if iterations <= 0 or not point_seeds:
         return point_seeds
 
-    coords_yx = np.column_stack(np.where(mask))
+    if coords_yx is None:
+        coords_yx = np.column_stack(np.where(mask))
     if coords_yx.size == 0:
         return point_seeds
 
@@ -89,28 +135,53 @@ def lloyd_relaxation(mask, point_seeds, rng_seed=None, iterations=4, step_fn=Non
         sample_xy = coords_xy
 
     seeds_arr = np.array(point_seeds, dtype=np.float32)
+    h, w = mask.shape
 
     for _ in range(iterations):
-        tree = cKDTree(seeds_arr)
-        _, labels = tree.query(sample_xy, k=1)
+        if spherical:
+            seeds_xyz = _pixel_to_sphere(seeds_arr, h, w)
+            sample_xyz = _pixel_to_sphere(sample_xy, h, w)
+            tree = cKDTree(seeds_xyz)
+            _, labels = tree.query(sample_xyz, k=1, workers=-1)
 
-        counts = np.bincount(labels, minlength=len(seeds_arr))
-        sum_x = np.bincount(labels, weights=sample_xy[:, 0], minlength=len(seeds_arr))
-        sum_y = np.bincount(labels, weights=sample_xy[:, 1], minlength=len(seeds_arr))
+            counts = np.bincount(labels, minlength=len(seeds_arr))
+            safe_c = np.where(counts > 0, counts, 1).astype(np.float32)
+            c0 = np.bincount(labels, weights=sample_xyz[:, 0].astype(np.float64),
+                             minlength=len(seeds_arr)) / safe_c
+            c1 = np.bincount(labels, weights=sample_xyz[:, 1].astype(np.float64),
+                             minlength=len(seeds_arr)) / safe_c
+            c2 = np.bincount(labels, weights=sample_xyz[:, 2].astype(np.float64),
+                             minlength=len(seeds_arr)) / safe_c
+            centroids_3d = np.stack([c0, c1, c2], axis=1).astype(np.float32)
+            norms = np.linalg.norm(centroids_3d, axis=1, keepdims=True)
+            norms = np.where(norms > 1e-8, norms, 1.0)
+            centroids_3d /= norms
+            new_xy = _sphere_to_pixel(centroids_3d, h, w)
+            cx = np.clip(np.round(new_xy[:, 0]).astype(np.int32), 0, w - 1)
+            cy = np.clip(np.round(new_xy[:, 1]).astype(np.int32), 0, h - 1)
+        else:
+            tree = cKDTree(seeds_arr)
+            _, labels = tree.query(sample_xy, k=1, workers=-1)
 
-        for i in range(len(seeds_arr)):
-            if counts[i] <= 0:
-                idx = rng.integers(0, len(sample_xy))
-                seeds_arr[i] = sample_xy[idx]
-                continue
+            counts = np.bincount(labels, minlength=len(seeds_arr))
+            safe_c = np.where(counts > 0, counts, 1)
+            cx = np.clip(
+                np.round(np.bincount(labels, weights=sample_xy[:, 0],
+                                     minlength=len(seeds_arr)) / safe_c
+                         ).astype(np.int32), 0, w - 1)
+            cy = np.clip(
+                np.round(np.bincount(labels, weights=sample_xy[:, 1],
+                                     minlength=len(seeds_arr)) / safe_c
+                         ).astype(np.int32), 0, h - 1)
 
-            cx = int(round(sum_x[i] / counts[i]))
-            cy = int(round(sum_y[i] / counts[i]))
-            cx = max(0, min(cx, mask.shape[1] - 1))
-            cy = max(0, min(cy, mask.shape[0] - 1))
-
-            if mask[cy, cx]:
-                seeds_arr[i] = (cx, cy)
+        has_pts = counts > 0
+        can_move = has_pts & mask[cy, cx]
+        seeds_arr[can_move, 0] = cx[can_move]
+        seeds_arr[can_move, 1] = cy[can_move]
+        empty = ~has_pts
+        if empty.any():
+            rand_idx = rng.integers(0, len(sample_xy), size=int(empty.sum()))
+            seeds_arr[empty] = sample_xy[rand_idx]
 
         if step_fn is not None:
             step_fn(1)
@@ -161,22 +232,47 @@ def _remove_enclaves(pmap, mask):
     Smaller fragments are cleared and then filled from their nearest
     assigned neighbor, eliminating enclaves.
     """
-    unique_ids = np.unique(pmap[mask])
-    unique_ids = unique_ids[unique_ids >= 0]
+    valid_mask = mask & (pmap >= 0)
+    if not valid_mask.any():
+        return
+
+    # Collect all pixel coordinates once and sort by province ID,
+    # avoiding a full-map scan per province.
+    ys, xs = np.where(valid_mask)
+    pids = pmap[ys, xs]
+    sort_idx = np.argsort(pids, kind='stable')
+    sorted_pids = pids[sort_idx]
+    sorted_ys = ys[sort_idx]
+    sorted_xs = xs[sort_idx]
+
+    group_ends = np.concatenate(
+        [np.where(np.diff(sorted_pids) != 0)[0] + 1, [len(sorted_pids)]])
+    group_starts = np.concatenate([[0], group_ends[:-1]])
 
     cleared = np.zeros(pmap.shape, dtype=bool)
 
-    for rid in unique_ids:
-        region_mask = pmap == rid
-        labeled, n = ndlabel(region_mask)
+    for start, end in zip(group_starts, group_ends):
+        ry = sorted_ys[start:end]
+        rx = sorted_xs[start:end]
+
+        # Crop ndlabel to bounding box of this province (often tiny vs full map)
+        r0, r1 = int(ry.min()), int(ry.max()) + 1
+        c0, c1 = int(rx.min()), int(rx.max()) + 1
+        rid = int(sorted_pids[start])
+        sub_mask = pmap[r0:r1, c0:c1] == rid
+        labeled, n = ndlabel(sub_mask)
         if n <= 1:
             continue
+
         # Keep only the largest component
         comp_sizes = np.bincount(labeled.ravel())[1:]  # skip background 0
         largest = comp_sizes.argmax() + 1
-        small = region_mask & (labeled != largest)
-        pmap[small] = -1
-        cleared |= small
+        small_sub = sub_mask & (labeled != largest)
+        local_ys, local_xs = np.where(small_sub)
+        global_ys = local_ys + r0
+        global_xs = local_xs + c0
+        pmap[global_ys, global_xs] = -1
+        cleared[global_ys, global_xs] = True
 
     # Fill cleared pixels from nearest assigned neighbor
     if cleared.any() and (pmap >= 0).any():
@@ -184,7 +280,7 @@ def _remove_enclaves(pmap, mask):
         pmap[cleared] = pmap[ny[cleared], nx[cleared]]
 
 
-def assign_regions(mask, seeds, start_index, jagged=False):
+def assign_regions(mask, seeds, start_index, jagged=False, spherical=False):
     """
     Assign each pixel in mask to the nearest seed, respecting boundaries.
 
@@ -198,6 +294,11 @@ def assign_regions(mask, seeds, start_index, jagged=False):
     coordinates before the nearest-seed query, producing irregular
     borders instead of straight Voronoi edges.  A post-processing pass
     removes any enclaves created by the noise.
+
+    When spherical=True, pixel coordinates are projected onto the unit sphere
+    (equirectangular assumed) and the KDTree query uses 3-D Euclidean distance,
+    which is monotonically equivalent to great-circle distance.  This produces
+    Voronoi cells of equal apparent size on the globe.
     """
     h, w = mask.shape
     pmap = np.full((h, w), -1, np.int32)
@@ -215,6 +316,17 @@ def assign_regions(mask, seeds, start_index, jagged=False):
     # Label connected components of mask
     labeled, num_components = ndlabel(mask)
 
+    def _build_and_query(local_seeds_xy, query_xy):
+        """Build KDTree and query; uses sphere coords when spherical=True."""
+        if spherical:
+            tree = cKDTree(_pixel_to_sphere(local_seeds_xy, h, w))
+            _, lbl = tree.query(_pixel_to_sphere(query_xy, h, w),
+                                k=1, workers=-1)
+        else:
+            tree = cKDTree(local_seeds_xy)
+            _, lbl = tree.query(query_xy, k=1, workers=-1)
+        return lbl
+
     if num_components <= 1:
         # Single component (or empty) — fast global KDTree
         coords_yx = np.column_stack(np.where(mask))
@@ -223,8 +335,7 @@ def assign_regions(mask, seeds, start_index, jagged=False):
         if jitter_x is not None:
             query_xy = _jitter_coords(coords_xy, coords_yx,
                                       jitter_x, jitter_y)
-        tree = cKDTree(seeds_arr)
-        _, labels = tree.query(query_xy, k=1)
+        labels = _build_and_query(seeds_arr, query_xy)
         pmap[coords_yx[:, 0], coords_yx[:, 1]] = labels + start_index
     else:
         # Map each seed to its component
@@ -249,8 +360,7 @@ def assign_regions(mask, seeds, start_index, jagged=False):
                                           jitter_x, jitter_y)
 
             local_seeds = seeds_arr[seed_indices]
-            tree = cKDTree(local_seeds)
-            _, labels = tree.query(query_xy, k=1)
+            labels = _build_and_query(local_seeds, query_xy)
 
             global_indices = np.array(seed_indices, dtype=np.int32)
             pmap[coords_yx[:, 0], coords_yx[:, 1]] = (
@@ -286,9 +396,15 @@ def assign_borders(pmap, border_mask):
     if not valid.any() or not border_mask.any():
         return
 
-    _, (ny, nx) = distance_transform_edt(~valid, return_indices=True)
-    bm = border_mask
-    pmap[bm] = pmap[ny[bm], nx[bm]]
+    # Crop EDT to bounding box of assigned+border pixels; avoids full-map transform
+    roi_rows, roi_cols = np.where(valid | border_mask)
+    r0, r1 = int(roi_rows.min()), int(roi_rows.max()) + 1
+    c0, c1 = int(roi_cols.min()), int(roi_cols.max()) + 1
+    sub_valid = valid[r0:r1, c0:c1]
+    sub_border = border_mask[r0:r1, c0:c1]
+    _, (ny, nx) = distance_transform_edt(~sub_valid, return_indices=True)
+    sub = pmap[r0:r1, c0:c1]
+    sub[sub_border] = sub[ny[sub_border], nx[sub_border]]
 
 
 def combine_maps(land_map, sea_map, metadata, land_mask, sea_mask):
@@ -319,10 +435,11 @@ def combine_maps(land_map, sea_map, metadata, land_mask, sea_mask):
     if not metadata:
         return Image.fromarray(out), combined
 
-    color_lut = np.zeros((len(metadata), 3), np.uint8)
+    max_idx = max(d["_pmap_index"] for d in metadata)
+    color_lut = np.zeros((max_idx + 1, 3), np.uint8)
 
-    for index, d in enumerate(metadata):
-        color_lut[index] = (d["R"], d["G"], d["B"])
+    for d in metadata:
+        color_lut[d["_pmap_index"]] = (d["R"], d["G"], d["B"])
 
     valid = combined >= 0
     out[valid] = color_lut[combined[valid]]
@@ -416,7 +533,8 @@ def extract_masks(boundary_image, land_image):
 
 def create_region_map(fill_mask, border_mask, num_points, start_index,
                       ptype, series, id_key, type_key, step_fn=None,
-                      density=None, density_strength=1.0, jagged=False):
+                      density=None, density_strength=1.0, jagged=False,
+                      spherical=False):
     """Unified region map creator for both provinces and territories.
 
     id_key/type_key control metadata key names (e.g. "province_id"/"province_type"
@@ -429,8 +547,13 @@ def create_region_map(fill_mask, border_mask, num_points, start_index,
         empty = np.full(fill_mask.shape, -1, np.int32)
         return empty, [], start_index
 
+    # Compute mask coords once; share across random_seeds and lloyd_relaxation
+    # to avoid two redundant full-map np.where scans.
+    coords_yx = np.column_stack(np.where(fill_mask))
+
     seeds = random_seeds(fill_mask, num_points, density=density,
-                         density_strength=density_strength)
+                         density_strength=density_strength, coords_yx=coords_yx,
+                         spherical=spherical)
     _step(1)  # sampling done
 
     if not seeds:
@@ -439,9 +562,11 @@ def create_region_map(fill_mask, border_mask, num_points, start_index,
         return empty, [], start_index
 
     seeds = lloyd_relaxation(fill_mask, seeds,
-                             iterations=config.LLOYD_ITERATIONS, step_fn=_step)
+                             iterations=config.LLOYD_ITERATIONS, step_fn=_step,
+                             coords_yx=coords_yx, spherical=spherical)
 
-    pmap = assign_regions(fill_mask, seeds, start_index, jagged=jagged)
+    pmap = assign_regions(fill_mask, seeds, start_index, jagged=jagged,
+                          spherical=spherical)
     _step(1)  # assign done
 
     metadata = _build_region_metadata(pmap, seeds, start_index, ptype,

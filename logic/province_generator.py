@@ -22,6 +22,7 @@ def generate_province_map(main_layout):
     exclude_ocean_density = main_layout.province_exclude_ocean_density.isChecked()
     jagged_land = main_layout.province_jagged_land.isChecked()
     jagged_ocean = main_layout.province_jagged_ocean.isChecked()
+    spherical = main_layout.province_spherical.isChecked()
     map_h, map_w = masks["map_h"], masks["map_w"]
 
     total_land_provs = main_layout.land_slider.value()
@@ -45,14 +46,27 @@ def generate_province_map(main_layout):
 
     # Compute average density weight per territory (darker = higher weight)
     # Ocean territories get normalized weight when excluded
+    # Vectorized: compute per-territory mean density in a single bincount pass
+    flat_terr = territory_pmap.ravel()
+    valid_flat = flat_terr >= 0
+    flat_density = (density_arr if density_arr.ndim == 2
+                    else density_arr.mean(axis=-1)).ravel().astype(np.float64)
+    max_idx = int(unique.max()) + 1 if len(unique) > 0 else 0
+    valid_terr_flat = flat_terr[valid_flat]
+    terr_den_sums = np.bincount(valid_terr_flat,
+                                weights=flat_density[valid_flat],
+                                minlength=max_idx)
+    terr_px_counts = np.bincount(valid_terr_flat, minlength=max_idx)
+
     density_weights = {}
     for idx in unique:
-        if int(idx) in ocean_terr_indices:
-            density_weights[int(idx)] = 1.0
+        iidx = int(idx)
+        if iidx in ocean_terr_indices:
+            density_weights[iidx] = 1.0
         else:
-            terr_mask = territory_pmap == idx
-            mean_val = density_arr[terr_mask].mean()
-            density_weights[int(idx)] = (256.0 - mean_val) ** density_strength
+            cnt = int(terr_px_counts[iidx])
+            mean_val = terr_den_sums[iidx] / cnt if cnt > 0 else 128.0
+            density_weights[iidx] = (256.0 - mean_val) ** density_strength
 
     land_alloc = _distribute(land_terrs, total_land_provs, pixel_counts,
                              density_weights)
@@ -113,18 +127,21 @@ def generate_province_map(main_layout):
                 terr.setdefault("province_ids", []).append(rid)
             start_index += 1
 
+    # Precompute combined masks — these are constant across all territory iterations
+    if lake_mask is not None:
+        fill_base = ~lake_mask & ~boundary_mask
+        border_base = boundary_mask | lake_mask
+    else:
+        fill_base = ~boundary_mask
+        border_base = boundary_mask
+
     for terr, prov_count in all_terrs:
         terr_mask = territory_pmap == terr["_pmap_index"]
         ptype = terr["territory_type"]
         tid = terr["territory_id"]
 
-        # Subdivide non-lake pixels in this territory
-        if lake_mask is not None:
-            terr_fill = terr_mask & ~lake_mask & ~boundary_mask
-            terr_border = (terr_mask & boundary_mask) | (terr_mask & lake_mask)
-        else:
-            terr_fill = terr_mask & ~boundary_mask
-            terr_border = terr_mask & boundary_mask
+        terr_fill = terr_mask & fill_base
+        terr_border = terr_mask & border_base
 
         if exclude_ocean_density and ptype == "ocean":
             terr_density = None
@@ -138,7 +155,7 @@ def generate_province_map(main_layout):
             terr_fill, terr_border, prov_count, start_index,
             ptype, series, "province_id", "province_type",
             density=terr_density, density_strength=terr_density_strength,
-            jagged=jagged
+            jagged=jagged, spherical=spherical
         )
 
         # Tag each province with its parent territory

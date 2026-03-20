@@ -164,6 +164,8 @@ class MainWindow(QWidget):
             jagged_col, "Jagged Land Borders")
         self.territory_jagged_ocean = create_checkbox(
             jagged_col, "Jagged Ocean Borders")
+        self.territory_spherical = create_checkbox(
+            jagged_col, "Spherical Map")
 
         self.button_gen_territories = create_button(territory_tab_layout,
                                                     "Generate Territories",
@@ -236,6 +238,8 @@ class MainWindow(QWidget):
             prov_jagged_col, "Jagged Land Borders")
         self.province_jagged_ocean = create_checkbox(
             prov_jagged_col, "Jagged Ocean Borders")
+        self.province_spherical = create_checkbox(
+            prov_jagged_col, "Spherical Map")
 
         self.button_gen_prov = create_button(province_tab_layout,
                                              "Generate Provinces",

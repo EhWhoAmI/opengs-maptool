@@ -22,10 +22,12 @@ def equator_density(layout):
         return
 
     w, h = land_image.size
-    # Black (0) at equator (middle row), white (255) at top/bottom poles
-    rows = np.linspace(0, 1, h)
-    gradient = np.abs(rows - 0.5) * 2.0  # 0 at center, 1 at edges
-    pixel_values = (gradient * 255).astype(np.uint8)
+    # Equirectangular correction: area per pixel ∝ cos(latitude).
+    # Pixel weight = (256 - value), so dark = more provinces.
+    # Set value = 255 * (1 - cos(lat)) so the equator (cos=1) is black
+    # and the poles (cos=0) are white, scaled by actual area distortion.
+    lats = np.linspace(np.pi / 2, -np.pi / 2, h)
+    pixel_values = (255.0 * (1.0 - np.cos(lats))).astype(np.uint8)
     arr = np.tile(pixel_values[:, np.newaxis], (1, w))
 
     density = Image.fromarray(arr, mode="L")
